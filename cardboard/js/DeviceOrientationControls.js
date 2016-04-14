@@ -1,201 +1,187 @@
 /**
- * DeviceOrientationControls - applies device orientation on object rotation
- *
- * @param {Object} object - instance of THREE.Object3D
- * @constructor
- *
- * @author richt / http://richt.me
- * @author WestLangley / http://github.com/WestLangley
- * @author jonobr1 / http://jonobr1.com
- * @author arodic / http://aleksandarrodic.com
- * @author doug / http://github.com/doug
- *
- * W3C Device Orientation control
- * (http://w3c.github.io/deviceorientation/spec-source-orientation.html)
+ A **CardboardLookAround** handles device orientation events and causes a Camera to look around while fixed in one place.
+
+ ## Usage
+
+ Stereo view of an Entity with CardboardLookAround control:
+
+ ````javascript
+ new XEO.Entity({
+     geometry: new XEO.BoxGeometry()
+ });
+
+ new Stereo();
+
+ new XEO.CardboardLookAround();
+ ````
+
+ Stereo view of an Entity with CardboardLookAround control, using custom Camera and Viewport:
+
+ ````javascript
+ var camera = new XEO.Camera({
+     view: new XEO.Lookat({
+         eye: [0, 0, 10],
+         look: [0, 0, 0],
+         up: [0, 1, 0]
+     }),
+     project: new XEO.Perspective({
+         fovy: 60,
+         near: 0.1,
+         far: 1000
+     })
+ });
+
+ var viewport = new XEO.Viewport();
+
+ var entity = new XEO.Entity({
+     camera: camera,
+     viewport: viewport,
+     geometry: new XEO.BoxGeometry()
+ });
+
+ new XEO.Stereo({
+     camera: camera,
+     viewport: viewport
+ });
+
+ new XEO.CardboardLookAround({
+     camera: camera,
+     active: true // Default
+ });
+ ````
+
+ @class CardboardLookAround
+ @module XEO
+ @submodule interaction
+ @constructor
+ @param [scene] {Scene} Parent {{#crossLink "Scene"}}Scene{{/crossLink}} - creates this CardboardLookAround in the default
+ {{#crossLink "Scene"}}Scene{{/crossLink}} when omitted.
+ @param [cfg] {*} Configs
+ @param [cfg.id] {String} Optional ID, unique among all components in the parent {{#crossLink "Scene"}}Scene{{/crossLink}},
+ generated automatically when omitted.
+ @param [cfg.meta] {String:Object} Optional map of user-defined metadata to attach to this CardboardLookAround.
+ @param [cfg.camera] {String|Camera} ID or instance of a {{#crossLink "Camera"}}Camera{{/crossLink}} for this CardboardLookAround.
+ Must be within the same {{#crossLink "Scene"}}Scene{{/crossLink}} as this CardboardLookAround. Defaults to the
+ parent {{#crossLink "Scene"}}Scene{{/crossLink}}'s default instance, {{#crossLink "Scene/camera:property"}}camera{{/crossLink}}.
+ @param [cfg.active=true] {Boolean} Whether or not this CardboardLookAround is active.
+ @extends CameraController
  */
+(function () {
 
+    "use strict";
 
-THREE.DeviceOrientationControls = function(object) {
+    XEO.CardboardLookAround = XEO.CameraController.extend({
 
-  this.object = object;
+        type: "XEO.CardboardLookAround",
 
-  this.object.rotation.reorder('YXZ');
+        _init: function (cfg) {
 
-  this.freeze = true;
+            this._super(cfg);
 
-  this.movementSpeed = 1.0;
-  this.rollSpeed = 0.005;
-  this.autoAlign = true;
-  this.autoForward = false;
+            var input = this.scene.input;
 
-  this.alpha = 0;
-  this.beta = 0;
-  this.gamma = 0;
-  this.orient = 0;
+            var onOrientationChange;
+            var onDeviceOrientation;
 
-  this.alignQuaternion = new THREE.Quaternion();
-  this.orientationQuaternion = new THREE.Quaternion();
+            var orientation;
+            var orientationAngle;
 
-  var quaternion = new THREE.Quaternion();
-  var quaternionLerp = new THREE.Quaternion();
+            var math = XEO.math;
+            var euler = math.vec3();
+            var tempVec3a = math.vec3();
+            var tempVec3b = math.vec3();
 
-  var tempVector3 = new THREE.Vector3();
-  var tempMatrix4 = new THREE.Matrix4();
-  var tempEuler = new THREE.Euler(0, 0, 0, 'YXZ');
-  var tempQuaternion = new THREE.Quaternion();
+            var reflectQuaternion = math.identityQuaternion();
+            reflectQuaternion[0] = -Math.sqrt(0.5);
+            reflectQuaternion[3] = Math.sqrt(0.5);
 
-  var zee = new THREE.Vector3(0, 0, 1);
-  var up = new THREE.Vector3(0, 1, 0);
-  var v0 = new THREE.Vector3(0, 0, 0);
-  var euler = new THREE.Euler();
-  var q0 = new THREE.Quaternion(); // - PI/2 around the x-axis
-  var q1 = new THREE.Quaternion(- Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+            var quaternion = math.identityQuaternion();
+            var orientQuaternion = math.identityQuaternion();
+            var alignQuaternion = math.identityQuaternion();
+            var orientMatrix = math.mat4();
 
-  this.deviceOrientation = {};
-  this.screenOrientation = window.orientation || 0;
+            var self = this;
 
-  this.onDeviceOrientationChangeEvent = (function(rawEvtData) {
+            // ---------- TESTING -----------------------------------
+            var alpha = 0;
+            var beta = 90;
+            var gamma = 0;
 
-    this.deviceOrientation = rawEvtData;
+            window.alphaInc = 0;
+            window.betaInc = 0;
+            window.gammaInc = 0;
 
-  }).bind(this);
+            this.scene.on("tick", function () {
+                self.scene.input.fire("deviceorientation", {
+                    alpha: alpha += window.alphaInc, // Z
+                    beta: beta += window.betaInc, // X
+                    gamma: gamma += window.gammaInc // Y
+                });
+            });
+            // ------------------------------------------------------
 
-  var getOrientation = function() {
-    switch (window.screen.orientation || window.screen.mozOrientation) {
-      case 'landscape-primary':
-        return 90;
-      case 'landscape-secondary':
-        return -90;
-      case 'portrait-secondary':
-        return 180;
-      case 'portrait-primary':
-        return 0;
-    }
-    // this returns 90 if width is greater then height 
-    // and window orientation is undefined OR 0
-    // if (!window.orientation && window.innerWidth > window.innerHeight)
-    //   return 90;
-    return window.orientation || 0;
-  };
+            self.on("active",
+                function (active) {
+                    if (active) {
 
-  this.onScreenOrientationChangeEvent = (function() {
+                        onOrientationChange = input.on("orientationchange",
+                            function (e) {
 
-    this.screenOrientation = getOrientation();
+                                orientation = e.orientation;
+                                orientationAngle = e.orientationAngle;
+                            });
 
-  }).bind(this);
+                        onDeviceOrientation = input.on("deviceorientation",
+                            function (e) {
 
-  this.update = function(delta) {
+                                var lookat = self.camera.view;
 
-    return function() {
+                                var alpha = e.alpha ? math.DEGTORAD * e.alpha : 0; // Z
+                                var beta = e.beta ? math.DEGTORAD * e.beta : 0; // X'
+                                var gamma = e.gamma ? math.DEGTORAD * e.gamma : 0; // Y'
 
-      if (this.freeze) return;
+                                var orient = orientationAngle ? math.DEGTORAD * orientationAngle : 0;
 
-      // should not need this
-      var orientation = getOrientation(); 
-      if (orientation !== this.screenOrientation) {
-        this.screenOrientation = orientation;
-        this.autoAlign = true;
-      }
+                                euler[0] = beta;
+                                euler[1] = alpha;
+                                euler[2] = -gamma;
 
-      this.alpha = this.deviceOrientation.gamma ?
-        THREE.Math.degToRad(this.deviceOrientation.alpha) : 0; // Z
-      this.beta = this.deviceOrientation.beta ?
-        THREE.Math.degToRad(this.deviceOrientation.beta) : 0; // X'
-      this.gamma = this.deviceOrientation.gamma ?
-        THREE.Math.degToRad(this.deviceOrientation.gamma) : 0; // Y''
-      this.orient = this.screenOrientation ?
-        THREE.Math.degToRad(this.screenOrientation) : 0; // O
+                                math.eulerToQuaternion(euler, "YXZ", quaternion);
+                                math.mulQuaternions(quaternion,  reflectQuaternion, quaternion);
+                               // math.angleAxisToQuaternion(0, 0, 1, -orient, orientQuaternion);
+                                //math.mulQuaternions(orientQuaternion, quaternion, quaternion);
+                                math.mulQuaternions(quaternion, alignQuaternion, quaternion);
+                                math.quaternionToMat4(quaternion, orientMatrix);
 
-      // The angles alpha, beta and gamma
-      // form a set of intrinsic Tait-Bryan angles of type Z-X'-Y''
+                                // Rotate Camera look about eye using the matrix
 
-      // 'ZXY' for the device, but 'YXZ' for us
-      euler.set(this.beta, this.alpha, - this.gamma, 'YXZ');
+                                // Look
 
-      quaternion.setFromEuler(euler);
-      quaternionLerp.slerp(quaternion, 0.5); // interpolate
+                                tempVec3a[0] = 0;
+                                tempVec3a[1] = 0;
+                                tempVec3a[2] = -Math.abs(math.lenVec3(math.subVec3(lookat.look, lookat.eye, tempVec3b)));
 
-      // orient the device
-      if (this.autoAlign) this.orientationQuaternion.copy(quaternion); // interpolation breaks the auto alignment
-      else this.orientationQuaternion.copy(quaternionLerp);
+                                lookat.look = math.addVec3(math.transformVec3(orientMatrix, tempVec3a, tempVec3a), lookat.eye);
 
-      // camera looks out the back of the device, not the top
-      this.orientationQuaternion.multiply(q1);
+                                // Up
 
-      // adjust for screen orientation
-      this.orientationQuaternion.multiply(q0.setFromAxisAngle(zee, - this.orient));
+                                tempVec3a[0] = 0;
+                                tempVec3a[1] = 1;
+                                tempVec3a[2] = 0;
 
-      this.object.quaternion.copy(this.alignQuaternion);
-      this.object.quaternion.multiply(this.orientationQuaternion);
+                                lookat.up = math.transformVec3(orientMatrix, tempVec3a, tempVec3a);
 
-      if (this.autoForward) {
+                                if (self.autoForward) {
 
-        tempVector3
-          .set(0, 0, -1)
-          .applyQuaternion(this.object.quaternion, 'ZXY')
-          .setLength(this.movementSpeed / 50); // TODO: why 50 :S
+                                }
+                            });
 
-        this.object.position.add(tempVector3);
+                    } else {
 
-      }
-
-      if (this.autoAlign && this.alpha !== 0) {
-
-        this.autoAlign = false;
-
-        this.align();
-
-      }
-
-    };
-
-  }();
-
-  // //debug
-  // window.addEventListener('click', (function(){
-  //   this.align();
-  // }).bind(this)); 
-
-  this.align = function() {
-
-    tempVector3
-      .set(0, 0, -1)
-      .applyQuaternion( tempQuaternion.copy(this.orientationQuaternion).inverse(), 'ZXY' );
-
-    tempEuler.setFromQuaternion(
-      tempQuaternion.setFromRotationMatrix(
-        tempMatrix4.lookAt(tempVector3, v0, up)
-     )
-   );
-
-    tempEuler.set(0, tempEuler.y, 0);
-    this.alignQuaternion.setFromEuler(tempEuler);
-
-  };
-
-  this.connect = function() {
-
-    // run once on load
-    this.onScreenOrientationChangeEvent();
-
-    // window.addEventListener('orientationchange', this.onScreenOrientationChangeEvent, false);
-    window.addEventListener('deviceorientation', this.onDeviceOrientationChangeEvent, false);
-
-    this.freeze = false;
-
-    return this;
-
-  };
-
-  this.disconnect = function() {
-
-    this.freeze = true;
-
-    // window.removeEventListener('orientationchange', this.onScreenOrientationChangeEvent, false);
-    window.removeEventListener('deviceorientation', this.onDeviceOrientationChangeEvent, false);
-
-  };
-
-
-};
-
+                        input.off(onOrientationChange);
+                        input.off(onDeviceOrientation);
+                    }
+                });
+        }
+    });
+})();
